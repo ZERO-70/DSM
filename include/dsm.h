@@ -206,6 +206,52 @@ size_t dsm_get_total_memory(void);
  */
 void dsm_set_log_level(int level);
 
+/*============================================================================
+ * Page Information API
+ *===========================================================================*/
+
+/**
+ * Page information structure for detailed queries
+ */
+typedef struct {
+    uint32_t    owner_id;       /* Node that owns this page */
+    uint32_t    state;          /* 0=INVALID, 1=SHARED, 2=MODIFIED, 3=PENDING */
+    uint64_t    global_addr;    /* Global DSM address */
+    void       *local_addr;     /* Local virtual address */
+    size_t      size;           /* Page size */
+    uint64_t    version;        /* Page version for consistency */
+    int         dirty;          /* Whether page has been modified locally */
+} dsm_page_info_t;
+
+/**
+ * Get the node ID that owns the page containing the given address
+ * 
+ * @param addr Local pointer to any address within a DSM page
+ * @return Owner node ID (1 = master, 2+ = workers), or -1 if address not in DSM
+ * 
+ * @note This queries the local page table
+ */
+int dsm_get_page_owner(void *addr);
+
+/**
+ * Get detailed information about the page containing the given address
+ * 
+ * @param addr Local pointer to any address within a DSM page
+ * @param info Pointer to structure that will be filled with page information
+ * @return 0 on success, -1 if address not in DSM or info is NULL
+ * 
+ * @note State values: 0=INVALID, 1=SHARED, 2=MODIFIED, 3=PENDING
+ */
+int dsm_get_page_info(void *addr, dsm_page_info_t *info);
+
+/**
+ * Convert a page state value to a human-readable string
+ * 
+ * @param state Page state value (from dsm_page_info_t.state)
+ * @return String like "INVALID", "SHARED", "MODIFIED", "PENDING", or "UNKNOWN"
+ */
+const char* dsm_page_state_to_string(int state);
+
 #ifdef __cplusplus
 }
 #endif

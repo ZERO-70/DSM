@@ -178,10 +178,31 @@ dsm/
 
 ## Memory Model
 
-- **Centralized Ownership**: Master tracks page ownership
+This is a **Read-Replication DSM** (Single-Writer/Multiple-Reader):
+
+- **Centralized Ownership**: Master tracks page ownership (ownership is static)
 - **Demand Paging**: Pages fetched on first access
 - **SIGSEGV Handling**: Page faults trigger remote fetch
 - **mmap with PROT_NONE**: Initial pages have no access permissions
+- **Read Access**: Any node can read any page (fetched automatically on first access)
+- **Write Access**: Only the allocating node can write to a page
+  - Attempting to write to a remote page will cause a segmentation fault
+  - Use `dsm_lock()` to protect shared data modifications
+  - Design pattern: Allocate writable data on nodes that will modify it
+
+### Memory Access Rules
+
+| Operation | Behavior |
+|-----------|----------|
+| **Read remote page** | ✅ Works - Page fetched automatically via SIGSEGV |
+| **Write to own page** | ✅ Works - Full read/write access |
+| **Write to remote page** | ❌ Segmentation fault - Only owner can write |
+
+**Best Practices:**
+- For shared read-only data: Allocate once, read from all nodes
+- For shared writable data: Use `dsm_lock()` + `dsm_unlock()` around modifications
+- For producer/consumer: Producer allocates and writes, consumers read
+- For parallel computation: Partition data so each node owns its working set
 
 ## Synchronization
 
@@ -204,10 +225,12 @@ Set log level with `dsm_set_log_level()`:
 
 ## Limitations
 
+- **Read-Replication Model**: Only the allocating node can write to a page (by design)
 - Single LAN only (no NAT traversal)
 - No persistence (memory lost on restart)
 - No deadlock detection for locks
 - No automatic master failover
+- No dynamic ownership transfer
 
 ## Requirements
 
@@ -218,4 +241,3 @@ Set log level with `dsm_set_log_level()`:
 ## License
 
 MIT License
-# DSM

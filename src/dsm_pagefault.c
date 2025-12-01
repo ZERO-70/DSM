@@ -98,6 +98,7 @@ static void sigsegv_handler(int sig, siginfo_t *info, void *ucontext) {
     /* Store fault address for handler thread */
     ctx->pending_fault_addr = fault_addr;
     ctx->fault_handled = 0;
+    ctx->fault_result = 0;
     
     /* Signal the fault handler thread via eventfd */
     /* eventfd_write is async-signal-safe */
@@ -111,6 +112,15 @@ static void sigsegv_handler(int sig, siginfo_t *info, void *ucontext) {
     while (!ctx->fault_handled && ctx->running) {
         /* Busy wait - not ideal but necessary for signal safety */
         for (volatile int i = 0; i < 1000; i++);
+    }
+    
+    /* Check if fault handling failed */
+    if (ctx->fault_result != 0) {
+        /* Handler failed - restore old handler and re-raise */
+        g_in_handler = 0;
+        sigaction(SIGSEGV, &g_old_sigsegv_action, NULL);
+        raise(SIGSEGV);
+        return;
     }
     
     g_in_handler = 0;
@@ -157,8 +167,9 @@ static void* fault_handler_thread_func(void *arg) {
             LOG_ERROR("Failed to handle page fault at %p", fault_addr);
         }
         
-        /* Signal completion */
+        /* Signal completion with result */
         ctx->pending_fault_addr = NULL;
+        ctx->fault_result = result;
         ctx->fault_handled = 1;
     }
     
@@ -173,40 +184,63 @@ static void* fault_handler_thread_func(void *arg) {
 int dsm_page_fault_handle(void *fault_addr) {
     dsm_context_t *ctx = dsm_get_context();
     
+    LOG_INFO("[FAULT] ======== PAGE FAULT HANDLER START ========");
+    LOG_INFO("[FAULT] fault_addr=%p, local_node_id=%d", fault_addr, ctx->local_node_id);
+    
     /* Align to page boundary */
     void *page_addr = (void*)((uintptr_t)fault_addr & ~(DSM_PAGE_SIZE - 1));
     
-    LOG_DEBUG("Page fault: addr=%p, page=%p", fault_addr, page_addr);
+    LOG_INFO("[FAULT] Aligned page_addr=%p (DSM_PAGE_SIZE=0x%x)", page_addr, DSM_PAGE_SIZE);
     
     /* Find the page in our page table */
+    LOG_INFO("[FAULT] Calling dsm_page_lookup_local(%p)...", page_addr);
     dsm_page_t *page = dsm_page_lookup_local(page_addr);
     if (!page) {
-        LOG_ERROR("Faulted on unregistered page at %p", page_addr);
+        LOG_ERROR("[FAULT] Faulted on unregistered page at %p", page_addr);
         return -1;
     }
     
+    LOG_INFO("[FAULT] Lookup returned: page=%p, global=0x%lx, local=%p, owner=%d, state=%d",
+             (void*)page, page->global_addr, page->local_addr, page->owner_id, page->state);
+    
     pthread_mutex_lock(&page->lock);
+    
+    LOG_INFO("[FAULT] After lock - state=%d (0=INVALID, 1=SHARED, 2=MODIFIED, 3=PENDING)", page->state);
     
     /* Check page state */
     if (page->state == DSM_PAGE_MODIFIED || page->state == DSM_PAGE_SHARED) {
         /* Page is already valid - might be a write fault on shared page */
-        LOG_DEBUG("Page 0x%lx already valid (state=%d)", page->global_addr, page->state);
+        LOG_INFO("[FAULT] Page already valid (state=%d), checking ownership...", page->state);
+        LOG_INFO("[FAULT] page->owner_id=%d, ctx->local_node_id=%d", page->owner_id, ctx->local_node_id);
         
         /* Try to enable write access if we own it */
         if (page->owner_id == ctx->local_node_id) {
+            LOG_INFO("[FAULT] We own this page - upgrading to PROT_WRITE");
             if (mprotect(page->local_addr, DSM_PAGE_SIZE, PROT_READ | PROT_WRITE) != 0) {
-                LOG_ERROR("mprotect failed: %s", strerror(errno));
+                LOG_ERROR("[FAULT] mprotect failed: %s", strerror(errno));
                 pthread_mutex_unlock(&page->lock);
                 return -1;
             }
             page->state = DSM_PAGE_MODIFIED;
+            pthread_mutex_unlock(&page->lock);
+            LOG_INFO("[FAULT] Success - page upgraded to MODIFIED");
+            return 0;
+        } else {
+            /* Write fault on page we don't own - this is a programming error */
+            LOG_ERROR("[FAULT] *** WRITE FAULT ON NON-OWNED PAGE ***");
+            LOG_ERROR("[FAULT] page->global_addr=0x%lx", page->global_addr);
+            LOG_ERROR("[FAULT] page->owner_id=%d, ctx->local_node_id=%d", page->owner_id, ctx->local_node_id);
+            LOG_ERROR("[FAULT] page->state=%d, page->local_addr=%p", page->state, page->local_addr);
+            LOG_ERROR("Write fault on page 0x%lx owned by node %d (we are node %d)", 
+                     page->global_addr, page->owner_id, ctx->local_node_id);
+            LOG_ERROR("Read-Replication DSM: Only the owner can write to a page");
+            LOG_ERROR("Use dsm_lock() to protect shared data, or allocate on the writing node");
+            pthread_mutex_unlock(&page->lock);
+            return -1;  /* Fail - will trigger default SIGSEGV handler */
         }
-        
-        pthread_mutex_unlock(&page->lock);
-        return 0;
     }
     
-    /* Page is invalid - need to fetch from owner */
+    LOG_INFO("[FAULT] Page is INVALID (state=%d) - need to fetch from owner", page->state);
     if (page->owner_id == ctx->local_node_id) {
         /* We own this page but it's invalid? This shouldn't happen */
         LOG_WARN("Local page 0x%lx is invalid - enabling access", page->global_addr);

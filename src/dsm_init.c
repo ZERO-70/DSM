@@ -314,7 +314,23 @@ int dsm_init_with_params(uint16_t port, uint32_t chunks) {
     } else {
         LOG_INFO("Master found - becoming WORKER");
         g_dsm_ctx.local_role = DSM_ROLE_WORKER;
-        /* Worker node_id assigned by master during join */
+        /* Worker node_id will be assigned by master during join */
+        /* Wait for node_id assignment before continuing */
+        LOG_INFO("Waiting for node_id assignment from master...");
+        int wait_count = 0;
+        while (g_dsm_ctx.local_node_id == 0 && wait_count < 50) {
+            usleep(100000);  /* 100ms */
+            wait_count++;
+        }
+        if (g_dsm_ctx.local_node_id == 0) {
+            LOG_ERROR("Timeout waiting for node_id assignment from master");
+            dsm_udp_shutdown();
+            dsm_tcp_shutdown();
+            dsm_node_table_destroy();
+            dsm_context_destroy();
+            return -1;
+        }
+        LOG_INFO("Received node_id=%d from master", g_dsm_ctx.local_node_id);
     }
     
     /* Step 7: Initialize memory subsystem */

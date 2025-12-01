@@ -55,6 +55,7 @@ typedef struct {
     pthread_mutex_t     fault_mutex;
     pthread_cond_t      fault_cond;
     volatile int        fault_handled;      /* Flag: fault has been handled */
+    volatile int        fault_result;       /* Result: 0=success, -1=failure */
     
     /* Synchronization */
     dsm_lock_t          locks[DSM_MAX_LOCKS];

@@ -125,6 +125,7 @@ static void test_true_dsm(void) {
     /* This is the base of the shared address space */
     uint64_t shared_global_addr = 0x2000000;  /* 32MB mark */
     size_t size = 4096;  /* One page */
+    dsm_page_info_t page_info;
     
     if (dsm_is_master()) {
         printf("[MASTER] Allocating shared page at global addr 0x%lx\n", shared_global_addr);
@@ -136,7 +137,21 @@ static void test_true_dsm(void) {
             return;
         }
         
-        printf("[MASTER] Writing test data: 'HELLO DSM! From Master Node'\n");
+        /* Show initial page ownership */
+        printf("\n[MASTER] --- Page Info BEFORE Write ---\n");
+        if (dsm_get_page_info(data, &page_info) == 0) {
+            printf("[MASTER]   Owner Node:    %u %s\n", page_info.owner_id,
+                   page_info.owner_id == dsm_get_node_id() ? "(THIS NODE - we own it)" : "(REMOTE)");
+            printf("[MASTER]   State:         %s\n", dsm_page_state_to_string(page_info.state));
+            printf("[MASTER]   Global Addr:   0x%lx\n", page_info.global_addr);
+            printf("[MASTER]   Local Addr:    %p\n", page_info.local_addr);
+            printf("[MASTER]   Version:       %lu\n", page_info.version);
+            printf("[MASTER]   Dirty:         %s\n", page_info.dirty ? "YES" : "NO");
+        } else {
+            printf("[MASTER]   ERROR: Could not get page info!\n");
+        }
+        
+        printf("\n[MASTER] Writing test data: 'HELLO DSM! From Master Node'\n");
         strcpy(data, "HELLO DSM! From Master Node");
         
         /* Write more data to prove the whole page works */
@@ -145,7 +160,17 @@ static void test_true_dsm(void) {
         }
         data[200] = '\0';
         
-        printf("[MASTER] Data written. Page is ready for workers to fetch.\n");
+        /* Show page ownership after write */
+        printf("\n[MASTER] --- Page Info AFTER Write ---\n");
+        if (dsm_get_page_info(data, &page_info) == 0) {
+            printf("[MASTER]   Owner Node:    %u %s\n", page_info.owner_id,
+                   page_info.owner_id == dsm_get_node_id() ? "(THIS NODE - we own it)" : "(REMOTE)");
+            printf("[MASTER]   State:         %s\n", dsm_page_state_to_string(page_info.state));
+            printf("[MASTER]   Version:       %lu\n", page_info.version);
+            printf("[MASTER]   Dirty:         %s\n", page_info.dirty ? "YES" : "NO");
+        }
+        
+        printf("\n[MASTER] Data written. Page is ready for workers to fetch.\n");
         printf("[MASTER] Now press '6' on WORKER to read this data via page fault!\n");
         printf("[MASTER] Local address: %p\n", (void*)data);
         
@@ -161,13 +186,36 @@ static void test_true_dsm(void) {
             return;
         }
         
-        printf("[WORKER] Reading data from remote page...\n");
+        /* Show page info BEFORE reading (should be INVALID) */
+        printf("\n[WORKER] --- Page Info BEFORE Read ---\n");
+        if (dsm_get_page_info(data, &page_info) == 0) {
+            printf("[WORKER]   Owner Node:    %u (Node %u owns this page, we will fetch from them)\n", 
+                   page_info.owner_id, page_info.owner_id);
+            printf("[WORKER]   State:         %s (page not yet fetched)\n", dsm_page_state_to_string(page_info.state));
+            printf("[WORKER]   Global Addr:   0x%lx\n", page_info.global_addr);
+            printf("[WORKER]   Local Addr:    %p\n", page_info.local_addr);
+            printf("[WORKER]   Version:       %lu\n", page_info.version);
+        } else {
+            printf("[WORKER]   ERROR: Could not get page info!\n");
+        }
+        
+        printf("\n[WORKER] Reading data from remote page (this triggers page fault)...\n");
         
         /* This read will trigger SIGSEGV → page fault handler → fetch from master */
         printf("[WORKER] Message from master: '%s'\n", data);
         printf("[WORKER] Additional data: '%s'\n", data + 100);
         
-        printf("\n[WORKER] SUCCESS! Read data from master's memory via page fault!\n");
+        /* Show page info AFTER reading (should be SHARED) */
+        printf("\n[WORKER] --- Page Info AFTER Read ---\n");
+        if (dsm_get_page_info(data, &page_info) == 0) {
+            printf("[WORKER]   Owner Node:    %u (data was fetched from Node %u)\n", 
+                   page_info.owner_id, page_info.owner_id);
+            printf("[WORKER]   State:         %s (page now cached locally)\n", dsm_page_state_to_string(page_info.state));
+            printf("[WORKER]   Version:       %lu\n", page_info.version);
+        }
+        
+        printf("\n[WORKER] SUCCESS! Read data from Node %d's memory via page fault!\n", 
+               dsm_get_page_owner(data));
     }
 }
 

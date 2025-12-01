@@ -211,6 +211,9 @@ int dsm_page_register(uint64_t global_addr, void *local_addr, uint32_t owner_id)
     page->dirty = false;
     pthread_mutex_init(&page->lock, NULL);
     
+    LOG_INFO("[REGISTER] NEW PAGE: global=0x%lx, local=%p, owner=%d, state=%d, local_node_id=%d",
+             global_addr, local_addr, owner_id, page->state, ctx->local_node_id);
+    
     pthread_rwlock_wrlock(&ctx->page_table->rwlock);
     
     /* Expand if needed */
@@ -228,12 +231,13 @@ int dsm_page_register(uint64_t global_addr, void *local_addr, uint32_t owner_id)
         ctx->page_table->capacity = new_cap;
     }
     
+    size_t index = ctx->page_table->count;
     ctx->page_table->pages[ctx->page_table->count++] = page;
     
     pthread_rwlock_unlock(&ctx->page_table->rwlock);
     
-    LOG_DEBUG("Registered page: global=0x%lx, local=%p, owner=%d", 
-             global_addr, local_addr, owner_id);
+    LOG_INFO("[REGISTER] Page added at index %zu, total pages now: %zu", 
+             index, ctx->page_table->count);
     return 0;
 }
 
@@ -265,23 +269,52 @@ dsm_page_t* dsm_page_lookup_local(void *local_addr) {
     dsm_context_t *ctx = dsm_get_context();
     
     if (!ctx->page_table) {
+        LOG_ERROR("dsm_page_lookup_local: page_table is NULL");
         return NULL;
     }
     
     /* Align address to page boundary */
     uintptr_t addr = (uintptr_t)local_addr & ~(DSM_PAGE_SIZE - 1);
     
+    LOG_INFO("[LOOKUP] Searching for local_addr=%p (aligned=0x%lx), page_count=%zu",
+             local_addr, (unsigned long)addr, ctx->page_table->count);
+    
     pthread_rwlock_rdlock(&ctx->page_table->rwlock);
     
-    dsm_page_t *result = NULL;
+    /* DUMP ALL PAGES */
+    LOG_INFO("[LOOKUP] === FULL PAGE TABLE DUMP ===");
     for (size_t i = 0; i < ctx->page_table->count; i++) {
-        if ((uintptr_t)ctx->page_table->pages[i]->local_addr == addr) {
-            result = ctx->page_table->pages[i];
+        dsm_page_t *p = ctx->page_table->pages[i];
+        LOG_INFO("[LOOKUP]   [%zu] local=%p global=0x%lx owner=%d state=%d",
+                 i, p->local_addr, p->global_addr, p->owner_id, p->state);
+    }
+    LOG_INFO("[LOOKUP] === END DUMP ===");
+    
+    /* Search from END (newest pages first) to handle address reuse by mmap */
+    dsm_page_t *result = NULL;
+    LOG_INFO("[LOOKUP] Searching from end (index %zu down to 0)...", ctx->page_table->count - 1);
+    for (size_t i = ctx->page_table->count; i > 0; i--) {
+        dsm_page_t *p = ctx->page_table->pages[i - 1];
+        LOG_INFO("[LOOKUP]   Checking [%zu]: local=%p vs target=0x%lx => %s",
+                i - 1, p->local_addr, (unsigned long)addr,
+                ((uintptr_t)p->local_addr == addr) ? "MATCH" : "no");
+        if ((uintptr_t)p->local_addr == addr) {
+            result = p;
+            LOG_INFO("[LOOKUP] *** MATCH at [%zu]: global=0x%lx, owner=%d, state=%d ***", 
+                    i - 1, p->global_addr, p->owner_id, p->state);
             break;
         }
     }
     
     pthread_rwlock_unlock(&ctx->page_table->rwlock);
+    
+    if (!result) {
+        LOG_ERROR("[LOOKUP] No page found for addr 0x%lx", (unsigned long)addr);
+    } else {
+        LOG_INFO("[LOOKUP] Returning page: global=0x%lx, owner=%d, state=%d",
+                 result->global_addr, result->owner_id, result->state);
+    }
+    
     return result;
 }
 
@@ -834,4 +867,68 @@ void* dsm_map_remote(uint64_t global_addr, size_t size) {
              global_addr, region->base_addr);
     
     return region->base_addr;
+}
+
+/*============================================================================
+ * Public Page Information API
+ *===========================================================================*/
+
+int dsm_get_page_owner(void *addr) {
+    if (!addr) {
+        LOG_DEBUG("[PAGE_OWNER] NULL address provided");
+        return -1;
+    }
+    
+    LOG_DEBUG("[PAGE_OWNER] Looking up owner for addr=%p", addr);
+    
+    dsm_page_t *page = dsm_page_lookup_local(addr);
+    if (!page) {
+        LOG_DEBUG("[PAGE_OWNER] Address %p not found in page table", addr);
+        return -1;
+    }
+    
+    LOG_INFO("[PAGE_OWNER] addr=%p => global=0x%lx, owner=%d, state=%d",
+              addr, page->global_addr, page->owner_id, page->state);
+    
+    return (int)page->owner_id;
+}
+
+int dsm_get_page_info(void *addr, dsm_page_info_t *info) {
+    if (!addr || !info) {
+        LOG_DEBUG("[PAGE_INFO] NULL address or info pointer");
+        return -1;
+    }
+    
+    LOG_DEBUG("[PAGE_INFO] Looking up info for addr=%p", addr);
+    
+    dsm_page_t *page = dsm_page_lookup_local(addr);
+    if (!page) {
+        LOG_DEBUG("[PAGE_INFO] Address %p not found in page table", addr);
+        return -1;
+    }
+    
+    /* Fill in the info structure */
+    info->owner_id    = page->owner_id;
+    info->state       = (uint32_t)page->state;
+    info->global_addr = page->global_addr;
+    info->local_addr  = page->local_addr;
+    info->size        = page->size;
+    info->version     = page->version;
+    info->dirty       = page->dirty ? 1 : 0;
+    
+    LOG_INFO("[PAGE_INFO] addr=%p => owner=%d, state=%s, global=0x%lx, ver=%lu, dirty=%d",
+              addr, info->owner_id, dsm_page_state_to_string(info->state),
+              info->global_addr, info->version, info->dirty);
+    
+    return 0;
+}
+
+const char* dsm_page_state_to_string(int state) {
+    switch (state) {
+        case DSM_PAGE_INVALID:  return "INVALID";
+        case DSM_PAGE_SHARED:   return "SHARED";
+        case DSM_PAGE_MODIFIED: return "MODIFIED";
+        case DSM_PAGE_PENDING:  return "PENDING";
+        default:                return "UNKNOWN";
+    }
 }
