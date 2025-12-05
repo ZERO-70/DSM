@@ -80,11 +80,11 @@ typedef enum {
     DSM_NODE_STATE_DISCONNECTED
 } dsm_node_state_t;
 
-/** State of a memory page */
+/** State of a memory page (Invalidate/Exclusive Ownership Protocol) */
 typedef enum {
     DSM_PAGE_INVALID = 0,   /* No local copy, must fetch remotely */
-    DSM_PAGE_SHARED,        /* Read-only local copy */
-    DSM_PAGE_MODIFIED,      /* Exclusive write access */
+    DSM_PAGE_SHARED,        /* Read-only local copy (may exist on multiple nodes) */
+    DSM_PAGE_MODIFIED,      /* Exclusive write access (only THIS node has valid copy) */
     DSM_PAGE_PENDING        /* Waiting for data from remote */
 } dsm_page_state_t;
 
@@ -99,11 +99,14 @@ typedef enum {
     DSM_MSG_NEW_NODE        = 0x06,     /* Announce new node */
     DSM_MSG_NODE_LEFT       = 0x07,     /* Announce node departure */
     
-    /* Page management */
-    DSM_MSG_PAGE_REQUEST    = 0x10,     /* Request page data */
+    /* Page management (Invalidate/Exclusive Ownership Protocol) */
+    DSM_MSG_PAGE_REQUEST    = 0x10,     /* Request page data (read access) */
     DSM_MSG_PAGE_DATA       = 0x11,     /* Page content transfer */
-    DSM_MSG_PAGE_INVALIDATE = 0x12,     /* Invalidate remote copies */
+    DSM_MSG_PAGE_INVALIDATE = 0x12,     /* Invalidate remote copies (for write) */
     DSM_MSG_PAGE_ACK        = 0x13,     /* Page operation acknowledgment */
+    DSM_MSG_PAGE_WRITE_REQ  = 0x14,     /* Request page for writing (ownership xfer) */
+    DSM_MSG_INVALIDATE_ACK  = 0x15,     /* Acknowledge invalidation */
+    DSM_MSG_OWNERSHIP_XFER  = 0x16,     /* Transfer ownership to new node */
     
     /* Memory allocation */
     DSM_MSG_ALLOC_REQUEST   = 0x20,     /* Request memory allocation */
@@ -123,7 +126,11 @@ typedef enum {
     DSM_MSG_HEARTBEAT       = 0x40,     /* Keep-alive */
     DSM_MSG_HEARTBEAT_ACK   = 0x41,     /* Heartbeat response */
     DSM_MSG_SHUTDOWN        = 0x42,     /* Clean shutdown */
-    DSM_MSG_METADATA        = 0x43      /* Metadata sync */
+    DSM_MSG_METADATA        = 0x43,     /* Metadata sync */
+    
+    /* Page discovery */
+    DSM_MSG_LIST_PAGES_REQ  = 0x50,     /* Request list of all pages */
+    DSM_MSG_LIST_PAGES_RESP = 0x51      /* Response with page list */
 } dsm_msg_type_t;
 
 /*============================================================================
@@ -150,15 +157,19 @@ typedef struct {
     pthread_rwlock_t    rwlock;
 } dsm_node_table_t;
 
-/** Memory page metadata */
+/** Memory page metadata (with sharer tracking for Invalidate protocol) */
 typedef struct dsm_page {
     void               *local_addr;     /* Local virtual address */
     uint64_t            global_addr;    /* Global DSM address */
     size_t              size;
     dsm_page_state_t    state;
-    uint32_t            owner_id;       /* Node that owns this page */
+    uint32_t            owner_id;       /* Node that owns this page (for allocation) */
+    uint32_t            copyset[DSM_MAX_NODES]; /* Nodes that have copies (bitmap) */
+    uint32_t            copyset_count;  /* Number of nodes with copies */
     uint64_t            version;        /* For consistency */
     bool                dirty;
+    bool                in_use;         /* Whether page is allocated/in-use from pool */
+    bool                freed;          /* Whether page was explicitly freed and can be reused */
     pthread_mutex_t     lock;
 } dsm_page_t;
 
@@ -238,11 +249,46 @@ typedef struct __attribute__((packed)) {
     dsm_msg_node_info_t nodes[];        /* Flexible array */
 } dsm_msg_node_table_t;
 
-/** Page request message */
+/** Join response message (master -> worker) */
+typedef struct __attribute__((packed)) {
+    uint32_t            assigned_node_id;  /* Assigned node ID */
+    uint64_t            global_base_addr;  /* Global address for worker's memory */
+    uint32_t            chunks;            /* Number of chunks allocated */
+} dsm_msg_join_response_t;
+
+/** Page request message (for read access) */
 typedef struct __attribute__((packed)) {
     uint64_t            global_addr;
-    uint32_t            access_type;    /* 0=read, 1=write */
+    uint32_t            access_type;    /* 0=read, 1=write (deprecated, use PAGE_WRITE_REQ for write) */
 } dsm_msg_page_request_t;
+
+/** Page write request message (requests exclusive ownership) */
+typedef struct __attribute__((packed)) {
+    uint64_t            global_addr;
+    uint32_t            requesting_node; /* Node requesting write access */
+} dsm_msg_page_write_request_t;
+
+/** Page invalidate message */
+typedef struct __attribute__((packed)) {
+    uint64_t            global_addr;
+    uint32_t            new_owner;      /* Node that will become the new exclusive owner */
+} dsm_msg_page_invalidate_t;
+
+/** Invalidate acknowledgment message */
+typedef struct __attribute__((packed)) {
+    uint64_t            global_addr;
+    uint32_t            acking_node;    /* Node acknowledging the invalidation */
+} dsm_msg_invalidate_ack_t;
+
+/** Ownership transfer message (includes page data) */
+typedef struct __attribute__((packed)) {
+    uint64_t            global_addr;
+    uint32_t            new_owner;      /* Node receiving ownership */
+    uint32_t            old_owner;      /* Node giving up ownership */
+    uint32_t            size;
+    uint64_t            version;
+    uint8_t             data[];         /* Page content */
+} dsm_msg_ownership_xfer_t;
 
 /** Page data message */
 typedef struct __attribute__((packed)) {
@@ -275,5 +321,18 @@ typedef struct __attribute__((packed)) {
 typedef struct __attribute__((packed)) {
     uint32_t            barrier_id;
 } dsm_msg_barrier_t;
+
+/** Page entry for list pages response */
+typedef struct __attribute__((packed)) {
+    uint64_t            global_addr;
+    size_t              size;
+    uint32_t            owner_id;
+} dsm_page_entry_t;
+
+/** List pages response */
+typedef struct __attribute__((packed)) {
+    uint32_t            count;
+    dsm_page_entry_t    pages[];        /* Flexible array */
+} dsm_msg_list_pages_t;
 
 #endif /* DSM_TYPES_H */

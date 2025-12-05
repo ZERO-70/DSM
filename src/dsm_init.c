@@ -81,6 +81,18 @@ int dsm_context_init(void) {
         return -1;
     }
     
+    /* Initialize invalidate tracking (for Invalidate/Exclusive protocol) */
+    if (pthread_mutex_init(&g_dsm_ctx.invalidate_mutex, NULL) != 0) {
+        LOG_ERROR("Failed to init invalidate_mutex");
+        return -1;
+    }
+    if (pthread_cond_init(&g_dsm_ctx.invalidate_cond, NULL) != 0) {
+        LOG_ERROR("Failed to init invalidate_cond");
+        return -1;
+    }
+    g_dsm_ctx.invalidate_pending = 0;
+    g_dsm_ctx.invalidate_addr = 0;
+    
     /* Create eventfd for page fault signaling */
     g_dsm_ctx.fault_eventfd = eventfd(0, EFD_NONBLOCK);
     if (g_dsm_ctx.fault_eventfd < 0) {
@@ -109,6 +121,8 @@ void dsm_context_destroy(void) {
     pthread_mutex_destroy(&g_dsm_ctx.seq_mutex);
     pthread_mutex_destroy(&g_dsm_ctx.discovery_mutex);
     pthread_cond_destroy(&g_dsm_ctx.discovery_cond);
+    pthread_mutex_destroy(&g_dsm_ctx.invalidate_mutex);
+    pthread_cond_destroy(&g_dsm_ctx.invalidate_cond);
     
     LOG_DEBUG("Context destroyed");
 }

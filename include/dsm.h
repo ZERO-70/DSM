@@ -142,11 +142,12 @@ void dsm_free(void *addr);
  * is acquired. Lock IDs should be agreed upon by all nodes.
  * 
  * @param lock_id Lock identifier (0 to DSM_MAX_LOCKS-1)
+ * @return 0 on success, -1 on error (e.g., master not connected)
  * 
  * @note This call blocks until lock is acquired
  * @note Deadlock detection is not implemented - use carefully
  */
-void dsm_lock(int lock_id);
+int dsm_lock(int lock_id);
 
 /**
  * Release a distributed lock
@@ -224,6 +225,33 @@ typedef struct {
 } dsm_page_info_t;
 
 /**
+ * Local page entry for dsm_get_local_pages()
+ */
+typedef struct {
+    uint64_t    global_addr;    /* Global DSM address */
+    void       *local_addr;     /* Local virtual address (mapped) */
+    size_t      size;           /* Page size */
+    uint32_t    owner_id;       /* Node that owns this page */
+    uint32_t    state;          /* 0=INVALID, 1=SHARED, 2=MODIFIED, 3=PENDING */
+    int         in_use;         /* Whether allocated/in-use from pool */
+} dsm_local_page_t;
+
+/**
+ * Get all locally mapped pages on this node
+ * 
+ * Returns information about all pages that are locally mapped in this node's
+ * address space, including both local allocations and fetched remote pages.
+ * 
+ * @param pages     Pointer to array that will be allocated and filled
+ * @param count     Pointer to store number of pages returned
+ * @return 0 on success, -1 on error
+ * 
+ * @note Caller must free the returned pages array with free()
+ * @note This is a local operation - no network communication
+ */
+int dsm_get_local_pages(dsm_local_page_t **pages, uint32_t *count);
+
+/**
  * Get the node ID that owns the page containing the given address
  * 
  * @param addr Local pointer to any address within a DSM page
@@ -251,6 +279,69 @@ int dsm_get_page_info(void *addr, dsm_page_info_t *info);
  * @return String like "INVALID", "SHARED", "MODIFIED", "PENDING", or "UNKNOWN"
  */
 const char* dsm_page_state_to_string(int state);
+
+/*============================================================================
+ * Global/Cluster Page Discovery API
+ *===========================================================================*/
+
+/**
+ * Global page entry returned by dsm_get_global_pages()
+ * 
+ * Represents a page allocation known to the master's ownership table.
+ * These are all pages in the entire DSM cluster.
+ */
+typedef struct {
+    uint64_t    global_addr;    /* Global DSM address */
+    size_t      size;           /* Size of allocation */
+    uint32_t    owner_id;       /* Node that owns this page */
+} dsm_global_page_t;
+
+/* Legacy alias for backward compatibility */
+typedef dsm_global_page_t dsm_remote_page_t;
+
+/**
+ * Get all pages in the DSM cluster (global view)
+ * 
+ * Queries the master's ownership table for ALL page allocations in the system.
+ * This gives a cluster-wide view of memory - pages may or may not be locally
+ * mapped on this node.
+ * 
+ * @param pages     Pointer to array that will be allocated and filled
+ * @param count     Pointer to store number of pages returned
+ * @return 0 on success, -1 on error
+ * 
+ * @note Caller must free the returned pages array with free()
+ * @note Workers query master via network; master returns immediately
+ * @note Use dsm_get_local_pages() to see only locally mapped pages
+ */
+int dsm_get_global_pages(dsm_global_page_t **pages, uint32_t *count);
+
+/* Legacy alias for backward compatibility */
+#define dsm_discover_pages dsm_get_global_pages
+
+/*============================================================================
+ * Debugging
+ *===========================================================================*/
+
+/**
+ * Dump DSM state for debugging purposes
+ * 
+ * Prints comprehensive information about:
+ * - Node information (ID, role, connections)
+ * - Page table state
+ * - Lock states
+ * - Memory regions
+ * 
+ * @note Output goes to stdout with [DEBUG] prefix
+ */
+void dsm_debug_dump_state(void);
+
+/**
+ * Set debug log level
+ * 
+ * @param level 0=ERROR only, 1=INFO, 2=DEBUG (verbose)
+ */
+void dsm_set_log_level(int level);
 
 #ifdef __cplusplus
 }

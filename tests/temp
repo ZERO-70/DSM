@@ -1,0 +1,1 @@
+LD_LIBRARY_PATH=./bin ./bin/dsm_explorer 0 localhost 5000 10

@@ -198,4 +198,102 @@ int dsm_ownership_set(uint64_t global_addr, uint32_t owner_id);
  */
 int dsm_ownership_register(uint64_t global_addr, size_t size, uint32_t owner_id);
 
+/*============================================================================
+ * Invalidate/Exclusive Ownership Protocol
+ *===========================================================================*/
+
+/**
+ * Request write access to a page (ownership transfer)
+ * This is called when a non-owner node wants to write
+ * @param page Page to request write access to
+ * @return 0 on success, -1 on error
+ */
+int dsm_page_request_write(dsm_page_t *page);
+
+/**
+ * Handle incoming page write request (master receives)
+ * Coordinates invalidation and ownership transfer
+ * @param from_node Node requesting write access
+ * @param global_addr Page address
+ * @return 0 on success, -1 on error
+ */
+int dsm_handle_page_write_request(uint32_t from_node, uint64_t global_addr);
+
+/**
+ * Handle incoming page invalidate request
+ * Invalidates local copy and sends ACK
+ * @param global_addr Page to invalidate
+ * @param new_owner Node that will become the new owner
+ * @return 0 on success, -1 on error
+ */
+int dsm_handle_page_invalidate(uint64_t global_addr, uint32_t new_owner);
+
+/**
+ * Handle invalidate acknowledgment (master receives)
+ * @param from_node Node acknowledging
+ * @param global_addr Page address
+ * @return 0 on success, -1 on error
+ */
+int dsm_handle_invalidate_ack(uint32_t from_node, uint64_t global_addr);
+
+/**
+ * Handle ownership transfer (new owner receives)
+ * Receives page data and becomes exclusive owner
+ * @param global_addr Page address
+ * @param data Page data
+ * @param size Data size
+ * @param version Page version
+ * @param old_owner Previous owner
+ * @return 0 on success, -1 on error
+ */
+int dsm_handle_ownership_xfer(uint64_t global_addr, void *data, size_t size, 
+                               uint64_t version, uint32_t old_owner);
+
+/**
+ * Add a node to a page's copyset (master tracks who has copies)
+ * @param global_addr Page address
+ * @param node_id Node that now has a copy
+ */
+void dsm_page_copyset_add(uint64_t global_addr, uint32_t node_id);
+
+/**
+ * Remove a node from a page's copyset
+ * @param global_addr Page address
+ * @param node_id Node to remove
+ */
+void dsm_page_copyset_remove(uint64_t global_addr, uint32_t node_id);
+
+/**
+ * Clear a page's copyset (after invalidation)
+ * @param global_addr Page address
+ */
+void dsm_page_copyset_clear(uint64_t global_addr);
+
+/**
+ * Send page with ownership transfer
+ * @param node_id Destination node
+ * @param global_addr Page address
+ * @param transfer_ownership If true, also transfer ownership
+ * @return 0 on success, -1 on error
+ */
+int dsm_page_send_with_ownership(uint32_t node_id, uint64_t global_addr, int transfer_ownership);
+
+/*============================================================================
+ * Page Discovery (Internal Functions)
+ *===========================================================================*/
+
+/**
+ * Collect all ownership entries into a page list message (master only)
+ * @param out_count Output: number of entries
+ * @return Allocated message (caller must free), NULL on error
+ */
+dsm_msg_list_pages_t* dsm_ownership_collect_all(uint32_t *out_count);
+
+/**
+ * Store a list pages response (called from message handler)
+ * @param resp Response message
+ * @param size Size of response message
+ */
+void dsm_store_list_pages_response(dsm_msg_list_pages_t *resp, size_t size);
+
 #endif /* DSM_MEMORY_H */

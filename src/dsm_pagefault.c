@@ -7,6 +7,7 @@
  * The fault handler thread does the actual network I/O.
  */
 
+#include "dsm.h"
 #include "dsm_types.h"
 #include "dsm_network.h"
 #include "dsm_memory.h"
@@ -178,7 +179,12 @@ static void* fault_handler_thread_func(void *arg) {
 }
 
 /*============================================================================
- * Page Fault Handling Logic
+ * Page Fault Handling Logic (Invalidate/Exclusive Ownership Protocol)
+ * 
+ * This implements a full read/write DSM:
+ * - Read fault on INVALID page: Fetch shared copy from owner
+ * - Write fault on SHARED page we don't own: Request ownership transfer
+ * - Write fault on SHARED page we own: Upgrade to MODIFIED (exclusive)
  *===========================================================================*/
 
 int dsm_page_fault_handle(void *fault_addr) {
@@ -193,177 +199,286 @@ int dsm_page_fault_handle(void *fault_addr) {
     LOG_INFO("[FAULT] Aligned page_addr=%p (DSM_PAGE_SIZE=0x%x)", page_addr, DSM_PAGE_SIZE);
     
     /* Find the page in our page table */
-    LOG_INFO("[FAULT] Calling dsm_page_lookup_local(%p)...", page_addr);
     dsm_page_t *page = dsm_page_lookup_local(page_addr);
     if (!page) {
         LOG_ERROR("[FAULT] Faulted on unregistered page at %p", page_addr);
         return -1;
     }
     
-    LOG_INFO("[FAULT] Lookup returned: page=%p, global=0x%lx, local=%p, owner=%d, state=%d",
-             (void*)page, page->global_addr, page->local_addr, page->owner_id, page->state);
+    LOG_INFO("[FAULT] Found page: global=0x%lx, owner=%d, state=%s",
+             page->global_addr, page->owner_id, dsm_page_state_to_string(page->state));
     
     pthread_mutex_lock(&page->lock);
+    dsm_page_state_t current_state = page->state;
+    uint32_t page_owner = page->owner_id;
+    pthread_mutex_unlock(&page->lock);
     
-    LOG_INFO("[FAULT] After lock - state=%d (0=INVALID, 1=SHARED, 2=MODIFIED, 3=PENDING)", page->state);
-    
-    /* Check page state */
-    if (page->state == DSM_PAGE_MODIFIED || page->state == DSM_PAGE_SHARED) {
-        /* Page is already valid - might be a write fault on shared page */
-        LOG_INFO("[FAULT] Page already valid (state=%d), checking ownership...", page->state);
-        LOG_INFO("[FAULT] page->owner_id=%d, ctx->local_node_id=%d", page->owner_id, ctx->local_node_id);
-        
-        /* Try to enable write access if we own it */
-        if (page->owner_id == ctx->local_node_id) {
-            LOG_INFO("[FAULT] We own this page - upgrading to PROT_WRITE");
-            if (mprotect(page->local_addr, DSM_PAGE_SIZE, PROT_READ | PROT_WRITE) != 0) {
-                LOG_ERROR("[FAULT] mprotect failed: %s", strerror(errno));
-                pthread_mutex_unlock(&page->lock);
-                return -1;
-            }
-            page->state = DSM_PAGE_MODIFIED;
-            pthread_mutex_unlock(&page->lock);
-            LOG_INFO("[FAULT] Success - page upgraded to MODIFIED");
-            return 0;
-        } else {
-            /* Write fault on page we don't own - this is a programming error */
-            LOG_ERROR("[FAULT] *** WRITE FAULT ON NON-OWNED PAGE ***");
-            LOG_ERROR("[FAULT] page->global_addr=0x%lx", page->global_addr);
-            LOG_ERROR("[FAULT] page->owner_id=%d, ctx->local_node_id=%d", page->owner_id, ctx->local_node_id);
-            LOG_ERROR("[FAULT] page->state=%d, page->local_addr=%p", page->state, page->local_addr);
-            LOG_ERROR("Write fault on page 0x%lx owned by node %d (we are node %d)", 
-                     page->global_addr, page->owner_id, ctx->local_node_id);
-            LOG_ERROR("Read-Replication DSM: Only the owner can write to a page");
-            LOG_ERROR("Use dsm_lock() to protect shared data, or allocate on the writing node");
-            pthread_mutex_unlock(&page->lock);
-            return -1;  /* Fail - will trigger default SIGSEGV handler */
-        }
-    }
-    
-    LOG_INFO("[FAULT] Page is INVALID (state=%d) - need to fetch from owner", page->state);
-    if (page->owner_id == ctx->local_node_id) {
-        /* We own this page but it's invalid? This shouldn't happen */
-        LOG_WARN("Local page 0x%lx is invalid - enabling access", page->global_addr);
+    /*========================================================================
+     * Case 1: Page is MODIFIED (we have exclusive access)
+     * This shouldn't happen - the page should have PROT_READ|PROT_WRITE
+     *========================================================================*/
+    if (current_state == DSM_PAGE_MODIFIED) {
+        LOG_INFO("[FAULT] Page is MODIFIED - enabling write access");
         if (mprotect(page->local_addr, DSM_PAGE_SIZE, PROT_READ | PROT_WRITE) != 0) {
-            LOG_ERROR("mprotect failed: %s", strerror(errno));
-            pthread_mutex_unlock(&page->lock);
+            LOG_ERROR("[FAULT] mprotect failed: %s", strerror(errno));
             return -1;
         }
-        page->state = DSM_PAGE_MODIFIED;
-        pthread_mutex_unlock(&page->lock);
         return 0;
     }
     
-    /* Mark as pending */
-    page->state = DSM_PAGE_PENDING;
-    pthread_mutex_unlock(&page->lock);
-    
-    /* Fetch from owner */
-    LOG_INFO("Fetching page 0x%lx from owner node %d", page->global_addr, page->owner_id);
-    
-    /* Safety check - ensure context is valid */
-    if (!ctx) {
-        LOG_ERROR("Context is NULL in page fault handler!");
-        return -1;
-    }
-    
-    /* If master, query ownership table */
-    int owner_id = page->owner_id;
-    if (ctx->local_role == DSM_ROLE_MASTER) {
-        int actual_owner = dsm_ownership_get(page->global_addr);
-        if (actual_owner > 0) {
-            owner_id = actual_owner;
-        }
-    }
-    
-    LOG_DEBUG("Page fault: Need to fetch from owner_id=%d, local_role=%d, master_fd=%d",
-             owner_id, ctx->local_role, ctx->master_fd);
-    
-    /* Request page from owner */
-    LOG_DEBUG("Creating page request message...");
-    dsm_msg_page_request_t req;
-    req.global_addr = page->global_addr;
-    req.access_type = 0; /* Read access */
-    
-    LOG_DEBUG("Creating message header...");
-    dsm_msg_header_t hdr = dsm_create_header(DSM_MSG_PAGE_REQUEST, owner_id, sizeof(req));
-    LOG_DEBUG("Header created: magic=0x%x, src=%d, dst=%d", hdr.magic, hdr.src_node, hdr.dst_node);
-    
-    /* Get the socket to send to owner */
-    int owner_fd = -1;
-    
-    /* If we're a worker and owner is master (node 1), use master_fd directly */
-    if (ctx->local_role == DSM_ROLE_WORKER && owner_id == 1) {
-        owner_fd = ctx->master_fd;
-        LOG_DEBUG("Using master_fd=%d to reach owner node 1", owner_fd);
-    } else {
-        /* Look up in node table */
-        LOG_DEBUG("Looking up owner %d in node table", owner_id);
-        dsm_node_t *owner_node = dsm_node_table_get(owner_id);
-        if (owner_node && owner_node->tcp_fd >= 0) {
-            owner_fd = owner_node->tcp_fd;
-            LOG_DEBUG("Found owner_node->tcp_fd=%d", owner_fd);
+    /*========================================================================
+     * Case 2: Page is SHARED (we have read access, might be a write fault)
+     *========================================================================*/
+    if (current_state == DSM_PAGE_SHARED) {
+        LOG_INFO("[FAULT] Page is SHARED - this is a WRITE fault");
+        
+        /* Check if we already own this page */
+        if (page_owner == ctx->local_node_id) {
+            /* We own it but it's SHARED - upgrade to MODIFIED (exclusive) */
+            LOG_INFO("[FAULT] We own this page - upgrading to MODIFIED (exclusive)");
+            
+            /* If we're master, we need to invalidate other copies */
+            if (ctx->local_role == DSM_ROLE_MASTER) {
+                /* Check if anyone else has a copy */
+                pthread_mutex_lock(&page->lock);
+                int need_invalidate = 0;
+                for (uint32_t i = 0; i < DSM_MAX_NODES; i++) {
+                    if (page->copyset[i] && i != ctx->local_node_id) {
+                        need_invalidate = 1;
+                        break;
+                    }
+                }
+                pthread_mutex_unlock(&page->lock);
+                
+                if (need_invalidate) {
+                    LOG_INFO("[FAULT] Invalidating other copies before upgrading");
+                    /* Send invalidate to all other copy holders */
+                    dsm_msg_page_invalidate_t inv_msg;
+                    inv_msg.global_addr = page->global_addr;
+                    inv_msg.new_owner = ctx->local_node_id;
+                    
+                    pthread_mutex_lock(&ctx->invalidate_mutex);
+                    ctx->invalidate_addr = page->global_addr;
+                    ctx->invalidate_pending = 0;
+                    
+                    pthread_mutex_lock(&page->lock);
+                    for (uint32_t i = 0; i < DSM_MAX_NODES; i++) {
+                        if (page->copyset[i] && i != ctx->local_node_id) {
+                            ctx->invalidate_pending++;
+                            dsm_msg_header_t hdr = dsm_create_header(DSM_MSG_PAGE_INVALIDATE, i, sizeof(inv_msg));
+                            dsm_tcp_send(i, &hdr, &inv_msg);
+                        }
+                    }
+                    pthread_mutex_unlock(&page->lock);
+                    
+                    /* Wait for ACKs */
+                    if (ctx->invalidate_pending > 0) {
+                        struct timespec ts;
+                        clock_gettime(CLOCK_REALTIME, &ts);
+                        ts.tv_sec += 10;
+                        while (ctx->invalidate_pending > 0) {
+                            int ret = pthread_cond_timedwait(&ctx->invalidate_cond, &ctx->invalidate_mutex, &ts);
+                            if (ret == ETIMEDOUT) {
+                                LOG_ERROR("[FAULT] Timeout waiting for invalidate ACKs");
+                                pthread_mutex_unlock(&ctx->invalidate_mutex);
+                                return -1;
+                            }
+                        }
+                    }
+                    pthread_mutex_unlock(&ctx->invalidate_mutex);
+                    
+                    /* Clear copyset - we're now the only one */
+                    dsm_page_copyset_clear(page->global_addr);
+                    dsm_page_copyset_add(page->global_addr, ctx->local_node_id);
+                }
+            }
+            
+            /* Upgrade to MODIFIED */
+            if (mprotect(page->local_addr, DSM_PAGE_SIZE, PROT_READ | PROT_WRITE) != 0) {
+                LOG_ERROR("[FAULT] mprotect failed: %s", strerror(errno));
+                return -1;
+            }
+            pthread_mutex_lock(&page->lock);
+            page->state = DSM_PAGE_MODIFIED;
+            pthread_mutex_unlock(&page->lock);
+            
+            LOG_INFO("[FAULT] Upgraded to MODIFIED (exclusive write access)");
+            return 0;
         } else {
-            LOG_DEBUG("Owner node lookup failed: owner_node=%p", (void*)owner_node);
+            /* We have a shared copy but don't own it - need ownership transfer */
+            LOG_INFO("[FAULT] Write fault on SHARED page owned by node %d - requesting ownership", page_owner);
+            
+            /* Request ownership transfer through master */
+            pthread_mutex_lock(&page->lock);
+            page->state = DSM_PAGE_PENDING;
+            pthread_mutex_unlock(&page->lock);
+            
+            if (dsm_page_request_write(page) != 0) {
+                LOG_ERROR("[FAULT] Failed to get write access to page 0x%lx", page->global_addr);
+                pthread_mutex_lock(&page->lock);
+                page->state = DSM_PAGE_INVALID;
+                pthread_mutex_unlock(&page->lock);
+                return -1;
+            }
+            
+            LOG_INFO("[FAULT] Ownership transfer complete - now have MODIFIED access");
+            return 0;
         }
     }
     
-    if (owner_fd < 0) {
-        LOG_ERROR("Owner node %d not connected (owner_fd=%d, master_fd=%d)", 
-                 owner_id, owner_fd, ctx->master_fd);
+    /*========================================================================
+     * Case 3: Page is INVALID - need to fetch from owner (read fault)
+     *========================================================================*/
+    if (current_state == DSM_PAGE_INVALID) {
+        LOG_INFO("[FAULT] Page is INVALID - local page->owner_id=%d", page_owner);
+        
+        /* Get the ACTUAL current owner from authoritative source */
+        int actual_owner = page_owner;
+        
+        /* Master checks its ownership table (authoritative source) */
+        if (ctx->local_role == DSM_ROLE_MASTER) {
+            int table_owner = dsm_ownership_get(page->global_addr);
+            if (table_owner > 0) {
+                actual_owner = table_owner;
+                LOG_INFO("[FAULT] Master ownership table says owner is node %d", actual_owner);
+            }
+        }
+        /* Workers trust the local page->owner_id or could query master */
+        
+        LOG_INFO("[FAULT] Will fetch from actual owner node %d", actual_owner);
+        
+        /* Special case: we are the actual owner but page is invalid */
+        /* This should only happen if we're the original allocator */
+        if ((uint32_t)actual_owner == ctx->local_node_id) {
+            LOG_WARN("[FAULT] We (node %d) own this page but it's INVALID - enabling access", 
+                     ctx->local_node_id);
+            if (mprotect(page->local_addr, DSM_PAGE_SIZE, PROT_READ | PROT_WRITE) != 0) {
+                LOG_ERROR("[FAULT] mprotect failed: %s", strerror(errno));
+                return -1;
+            }
+            pthread_mutex_lock(&page->lock);
+            page->state = DSM_PAGE_MODIFIED;
+            page->owner_id = ctx->local_node_id;  /* Ensure consistency */
+            pthread_mutex_unlock(&page->lock);
+            return 0;
+        }
+        
+        /* Mark as pending and fetch from actual owner */
         pthread_mutex_lock(&page->lock);
-        page->state = DSM_PAGE_INVALID;
+        page->state = DSM_PAGE_PENDING;
         pthread_mutex_unlock(&page->lock);
-        return -1;
-    }
-    
-    LOG_INFO("Sending page request to owner %d via fd=%d", owner_id, owner_fd);
-    
-    if (dsm_tcp_send_raw(owner_fd, &hdr, sizeof(hdr)) != 0 ||
-        dsm_tcp_send_raw(owner_fd, &req, sizeof(req)) != 0) {
-        LOG_ERROR("Failed to send page request to owner %d", owner_id);
-        pthread_mutex_lock(&page->lock);
-        page->state = DSM_PAGE_INVALID;
-        pthread_mutex_unlock(&page->lock);
-        return -1;
-    }
-    
-    LOG_INFO("Page request sent successfully to owner %d", owner_id);
-    
-    /* Wait for page data to arrive (TCP thread will handle it) */
-    /* The TCP handler will call dsm_page_install which signals completion */
-    LOG_INFO("About to lock fault_mutex at %p", (void*)&ctx->fault_mutex);
-    
-    if (!ctx) {
-        LOG_ERROR("ctx is NULL before mutex lock!");
-        return -1;
-    }
-    
-    LOG_INFO("Locking fault_mutex...");
-    pthread_mutex_lock(&ctx->fault_mutex);
-    LOG_INFO("fault_mutex locked, setting up timeout");
-    
-    struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    ts.tv_sec += 10; /* 10 second timeout */
-    
-    LOG_INFO("Entering wait loop for page state (current=%d)", page->state);
-    while (page->state == DSM_PAGE_PENDING && ctx->running) {
-        int ret = pthread_cond_timedwait(&ctx->fault_cond, &ctx->fault_mutex, &ts);
-        if (ret == ETIMEDOUT) {
-            LOG_ERROR("Timeout waiting for page 0x%lx from owner %d", 
-                     page->global_addr, owner_id);
-            pthread_mutex_unlock(&ctx->fault_mutex);
+        
+        /* Build and send page request */
+        dsm_msg_page_request_t req;
+        req.global_addr = page->global_addr;
+        req.access_type = 0; /* Read access */
+        
+        dsm_msg_header_t hdr = dsm_create_header(DSM_MSG_PAGE_REQUEST, actual_owner, sizeof(req));
+        
+        /* Get socket to owner */
+        int owner_fd = -1;
+        
+        /* Workers sending to master use master_fd */
+        if (ctx->local_role == DSM_ROLE_WORKER && actual_owner == 1) {
+            owner_fd = ctx->master_fd;
+            LOG_DEBUG("[FAULT] Worker using master_fd=%d to reach master", owner_fd);
+        }
+        /* Master sending to worker, or worker sending to another worker */
+        else {
+            dsm_node_t *owner_node = dsm_node_table_get(actual_owner);
+            if (owner_node) {
+                LOG_DEBUG("[FAULT] Node table lookup for node %d: tcp_fd=%d, state=%d",
+                         actual_owner, owner_node->tcp_fd, owner_node->state);
+                if (owner_node->tcp_fd >= 0) {
+                    owner_fd = owner_node->tcp_fd;
+                }
+            } else {
+                LOG_ERROR("[FAULT] Node %d not found in node table!", actual_owner);
+            }
+        }
+        
+        if (owner_fd < 0) {
+            LOG_ERROR("[FAULT] Cannot reach owner node %d - no valid socket (fd=%d)", 
+                      actual_owner, owner_fd);
+            LOG_ERROR("[FAULT] Debug: local_role=%s, actual_owner=%d, local_node_id=%d",
+                      ctx->local_role == DSM_ROLE_MASTER ? "MASTER" : "WORKER",
+                      actual_owner, ctx->local_node_id);
+            
+            /* Dump node table entries for key nodes */
+            for (uint32_t nid = 1; nid <= 4; nid++) {
+                dsm_node_t *n = dsm_node_table_get(nid);
+                if (n) {
+                    LOG_ERROR("[FAULT]   Node %d: fd=%d, state=%d, ip=%s:%d",
+                              n->node_id, n->tcp_fd, n->state, n->ip, n->port);
+                }
+            }
+            
             pthread_mutex_lock(&page->lock);
             page->state = DSM_PAGE_INVALID;
             pthread_mutex_unlock(&page->lock);
             return -1;
         }
+        
+        LOG_INFO("[FAULT] Sending page request to owner %d via fd=%d", actual_owner, owner_fd);
+        
+        if (dsm_tcp_send_raw(owner_fd, &hdr, sizeof(hdr)) != 0 ||
+            dsm_tcp_send_raw(owner_fd, &req, sizeof(req)) != 0) {
+            LOG_ERROR("[FAULT] Failed to send page request");
+            pthread_mutex_lock(&page->lock);
+            page->state = DSM_PAGE_INVALID;
+            pthread_mutex_unlock(&page->lock);
+            return -1;
+        }
+        
+        /* Wait for page data */
+        pthread_mutex_lock(&ctx->fault_mutex);
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_sec += 10;
+        
+        while (page->state == DSM_PAGE_PENDING && ctx->running) {
+            int ret = pthread_cond_timedwait(&ctx->fault_cond, &ctx->fault_mutex, &ts);
+            if (ret == ETIMEDOUT) {
+                LOG_ERROR("[FAULT] Timeout waiting for page 0x%lx", page->global_addr);
+                pthread_mutex_unlock(&ctx->fault_mutex);
+                pthread_mutex_lock(&page->lock);
+                page->state = DSM_PAGE_INVALID;
+                pthread_mutex_unlock(&page->lock);
+                return -1;
+            }
+        }
+        pthread_mutex_unlock(&ctx->fault_mutex);
+        
+        LOG_INFO("[FAULT] Page 0x%lx fetched successfully (state=%s)", 
+                 page->global_addr, dsm_page_state_to_string(page->state));
+        return 0;
     }
-    pthread_mutex_unlock(&ctx->fault_mutex);
     
-    LOG_INFO("Page 0x%lx fetched successfully", page->global_addr);
-    return 0;
+    /*========================================================================
+     * Case 4: Page is PENDING - shouldn't get here, but wait for it
+     *========================================================================*/
+    if (current_state == DSM_PAGE_PENDING) {
+        LOG_WARN("[FAULT] Page is already PENDING - waiting for completion");
+        
+        pthread_mutex_lock(&ctx->fault_mutex);
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_sec += 10;
+        
+        while (page->state == DSM_PAGE_PENDING && ctx->running) {
+            int ret = pthread_cond_timedwait(&ctx->fault_cond, &ctx->fault_mutex, &ts);
+            if (ret == ETIMEDOUT) {
+                LOG_ERROR("[FAULT] Timeout waiting for pending page");
+                pthread_mutex_unlock(&ctx->fault_mutex);
+                return -1;
+            }
+        }
+        pthread_mutex_unlock(&ctx->fault_mutex);
+        return 0;
+    }
+    
+    LOG_ERROR("[FAULT] Unknown page state: %d", current_state);
+    return -1;
 }
 
 /*============================================================================

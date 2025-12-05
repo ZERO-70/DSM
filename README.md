@@ -169,34 +169,65 @@ dsm/
 | DISCOVER_DSM | UDP broadcast for node discovery |
 | JOIN_RESPONSE | Master assigns node ID |
 | NODE_TABLE | Full node table synchronization |
-| PAGE_REQUEST | Request page from owner |
+| PAGE_REQUEST | Request page from owner (read) |
 | PAGE_DATA | Page content transfer |
+| PAGE_WRITE_REQ | Request page for writing (ownership transfer) |
+| PAGE_INVALIDATE | Invalidate remote copies |
+| INVALIDATE_ACK | Acknowledge invalidation |
+| OWNERSHIP_XFER | Transfer ownership with page data |
 | LOCK_REQUEST | Request distributed lock |
 | LOCK_GRANT | Lock acquisition confirmed |
 | BARRIER_ENTER | Node entering barrier |
 | BARRIER_RELEASE | All nodes release barrier |
 
-## Memory Model
+## Memory Model: Invalidate/Exclusive Ownership Protocol
 
-This is a **Read-Replication DSM** (Single-Writer/Multiple-Reader):
+This is a **Full Read/Write DSM** with automatic ownership transfer:
 
-- **Centralized Ownership**: Master tracks page ownership (ownership is static)
-- **Demand Paging**: Pages fetched on first access
-- **SIGSEGV Handling**: Page faults trigger remote fetch
-- **mmap with PROT_NONE**: Initial pages have no access permissions
-- **Read Access**: Any node can read any page (fetched automatically on first access)
-- **Write Access**: Only the allocating node can write to a page
-  - Attempting to write to a remote page will cause a segmentation fault
-  - Use `dsm_lock()` to protect shared data modifications
-  - Design pattern: Allocate writable data on nodes that will modify it
+### Page States
+- **INVALID**: No local copy - access will trigger page fault
+- **SHARED**: Read-only local copy (may exist on multiple nodes)
+- **MODIFIED/EXCLUSIVE**: Exclusive write access (only this node has valid copy)
+- **PENDING**: Waiting for data transfer
+
+### Protocol Flow
+
+**Read Access (non-owner)**:
+1. Node reads page → SIGSEGV (page is INVALID)
+2. Page fault handler requests page from owner
+3. Owner sends page data, receiver gets SHARED copy
+4. If owner had EXCLUSIVE, downgrades to SHARED
+
+**Write Access (non-owner)**:
+1. Node writes to SHARED page → SIGSEGV (no write permission)
+2. Fault handler sends WRITE_REQUEST to master
+3. Master broadcasts INVALIDATE to all copy holders
+4. Nodes invalidate copies and send ACKs
+5. Current owner transfers ownership + data to requester
+6. Requester becomes EXCLUSIVE owner
+
+**Write Access (owner upgrading)**:
+1. Owner writes to SHARED page → SIGSEGV
+2. Master invalidates all other copies
+3. Owner upgrades to EXCLUSIVE (MODIFIED) state
 
 ### Memory Access Rules
 
 | Operation | Behavior |
 |-----------|----------|
-| **Read remote page** | ✅ Works - Page fetched automatically via SIGSEGV |
-| **Write to own page** | ✅ Works - Full read/write access |
-| **Write to remote page** | ❌ Segmentation fault - Only owner can write |
+| **Read remote page** | ✅ Works - Page fetched automatically, becomes SHARED |
+| **Write to own page** | ✅ Works - If SHARED, upgrades to MODIFIED |
+| **Write to remote page** | ✅ Works - Ownership transferred automatically |
+
+### Test 7: Demonstrating Ownership Transfer
+
+```
+# Run sequence:
+1. Master writes "MASTER WROTE THIS"
+2. Worker reads (gets SHARED copy via page fault)  
+3. Worker writes "WORKER WROTE THIS" (triggers ownership transfer!)
+4. Master reads back (sees worker's changes)
+```
 
 **Best Practices:**
 - For shared read-only data: Allocate once, read from all nodes

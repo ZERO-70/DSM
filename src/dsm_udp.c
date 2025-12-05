@@ -6,6 +6,7 @@
 #include "dsm_types.h"
 #include "dsm_network.h"
 #include "dsm_internal.h"
+#include "dsm_memory.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -128,12 +129,32 @@ static void* udp_listener_thread_func(void *arg) {
                     if (node_id > 0) {
                         LOG_INFO("Assigned node_id %d to new node", node_id);
                         
-                        /* Send join response with assigned node_id */
+                        /* Allocate global address range for worker's donated memory */
+                        size_t worker_region_size = msg_chunks * DSM_PAGE_SIZE;
+                        uint64_t worker_global_base = ctx->next_global_addr;
+                        ctx->next_global_addr += worker_region_size;
+                        
+                        LOG_INFO("Allocated global range 0x%lx - 0x%lx for node %d (%d chunks)",
+                                worker_global_base, worker_global_base + worker_region_size - 1,
+                                node_id, msg_chunks);
+                        
+                        /* Register worker's memory page-by-page in ownership table */
+                        size_t num_pages = msg_chunks;
+                        for (size_t i = 0; i < num_pages; i++) {
+                            dsm_ownership_register(worker_global_base + i * DSM_PAGE_SIZE, 
+                                                 DSM_PAGE_SIZE, node_id);
+                        }
+                        
+                        /* Send join response with assigned node_id and global address */
+                        dsm_msg_join_response_t join_resp;
+                        join_resp.assigned_node_id = node_id;
+                        join_resp.global_base_addr = worker_global_base;
+                        join_resp.chunks = msg_chunks;
+                        
                         dsm_msg_header_t hdr = dsm_create_header(DSM_MSG_JOIN_RESPONSE, 
-                                                                  node_id, sizeof(uint32_t));
-                        uint32_t assigned_id = node_id;
+                                                                  node_id, sizeof(join_resp));
                         dsm_tcp_send_raw(sockfd, &hdr, sizeof(hdr));
-                        dsm_tcp_send_raw(sockfd, &assigned_id, sizeof(assigned_id));
+                        dsm_tcp_send_raw(sockfd, &join_resp, sizeof(join_resp));
                         
                         /* Broadcast updated node table to all nodes */
                         dsm_node_table_broadcast();

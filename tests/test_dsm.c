@@ -86,7 +86,10 @@ static void test_locks(void) {
     int lock_id = 0;
     
     printf("Acquiring lock %d...\n", lock_id);
-    dsm_lock(lock_id);
+    if (dsm_lock(lock_id) != 0) {
+        printf("FAILED: Could not acquire lock %d (master not connected?)\n", lock_id);
+        return;
+    }
     printf("Lock %d acquired\n", lock_id);
     
     /* Do some work */
@@ -219,20 +222,151 @@ static void test_true_dsm(void) {
     }
 }
 
+/* Test 7: Read/Write DSM with Ownership Transfer
+ * 
+ * This test demonstrates the Invalidate/Exclusive Ownership protocol:
+ * - Master allocates memory and writes initial data
+ * - Worker reads it (gets SHARED copy)
+ * - Worker WRITES to it (triggers ownership transfer)
+ * - Master reads it back (sees worker's changes, gets SHARED copy)
+ * 
+ * Run sequence:
+ *   1. Press '7' on MASTER first - it allocates and writes "MASTER"
+ *   2. Press '7' on WORKER - it reads, then WRITES "WORKER"
+ *   3. Press '7' on MASTER again - it reads back and sees "WORKER"
+ */
+static void test_readwrite_dsm(void) {
+    printf("\n=== Test 7: Read/Write DSM (Ownership Transfer) ===\n");
+    printf("This test demonstrates full read/write distributed memory.\n");
+    printf("Any node can write to any page - ownership transfers automatically.\n\n");
+    
+    /* Use first page from master's pool (0x1000000) - no new allocation needed */
+    uint64_t shared_global_addr = 0x1000000;  /* First page in master's pool */
+    size_t size = 4096;  /* One page */
+    dsm_page_info_t page_info;
+    
+    if (dsm_is_master()) {
+        static int master_phase = 0;
+        master_phase++;
+        
+        if (master_phase == 1) {
+            /* Phase 1: Master uses existing pool page */
+            printf("[MASTER] Phase 1: Using pool page at 0x%lx\n", shared_global_addr);
+            
+            /* Just use dsm_malloc which will allocate from existing pool */
+            char *data = (char*)dsm_malloc(size);
+            if (!data) {
+                printf("[MASTER] FAILED: Could not allocate from pool\n");
+                return;
+            }
+            
+            printf("[MASTER] Writing initial message: 'MASTER WROTE THIS'\n");
+            strcpy(data, "MASTER WROTE THIS - version 1");
+            
+            if (dsm_get_page_info(data, &page_info) == 0) {
+                printf("[MASTER] Page at global 0x%lx, state: %s, owner: %u\n", 
+                       page_info.global_addr,
+                       dsm_page_state_to_string(page_info.state), page_info.owner_id);
+            }
+            
+            printf("\n[MASTER] Now press '7' on WORKER to read and then WRITE to this page.\n");
+            printf("[MASTER] After worker writes, press '7' on MASTER again to read back.\n");
+            
+        } else {
+            /* Phase 2+: Master reads back (should see worker's changes) */
+            printf("[MASTER] Phase 2: Reading page (may trigger page fault if worker took ownership)\n");
+            
+            char *data = (char*)dsm_map_remote(shared_global_addr, size);
+            if (!data) {
+                printf("[MASTER] FAILED: Could not map address\n");
+                return;
+            }
+            
+            if (dsm_get_page_info(data, &page_info) == 0) {
+                printf("[MASTER] Before read - State: %s, Owner: %u\n", 
+                       dsm_page_state_to_string(page_info.state), page_info.owner_id);
+            }
+            
+            printf("[MASTER] Reading data: '%s'\n", data);
+            
+            if (dsm_get_page_info(data, &page_info) == 0) {
+                printf("[MASTER] After read - State: %s, Owner: %u, Version: %lu\n", 
+                       dsm_page_state_to_string(page_info.state), page_info.owner_id,
+                       page_info.version);
+            }
+            
+            if (strstr(data, "WORKER") != NULL) {
+                printf("\n[MASTER] SUCCESS! Read worker's written data!\n");
+                printf("[MASTER] Ownership was transferred to worker when they wrote,\n");
+                printf("[MASTER] then master fetched the updated page to read.\n");
+            }
+        }
+    } else {
+        /* Worker: Read then WRITE */
+        printf("[WORKER] Mapping shared page at 0x%lx\n", shared_global_addr);
+        
+        char *data = (char*)dsm_map_remote(shared_global_addr, size);
+        if (!data) {
+            printf("[WORKER] FAILED: Could not map address (make sure MASTER ran first)\n");
+            return;
+        }
+        
+        printf("\n[WORKER] --- Reading (triggers page fault, gets SHARED copy) ---\n");
+        if (dsm_get_page_info(data, &page_info) == 0) {
+            printf("[WORKER] Before read - State: %s, Owner: %u\n", 
+                   dsm_page_state_to_string(page_info.state), page_info.owner_id);
+        }
+        
+        printf("[WORKER] Read data: '%s'\n", data);
+        
+        if (dsm_get_page_info(data, &page_info) == 0) {
+            printf("[WORKER] After read - State: %s, Owner: %u\n", 
+                   dsm_page_state_to_string(page_info.state), page_info.owner_id);
+        }
+        
+        printf("\n[WORKER] --- Writing (triggers ownership transfer!) ---\n");
+        printf("[WORKER] This will:\n");
+        printf("[WORKER]   1. Send WRITE_REQUEST to master\n");
+        printf("[WORKER]   2. Master invalidates all copies\n");
+        printf("[WORKER]   3. Current owner sends page + ownership to us\n");
+        printf("[WORKER]   4. We become exclusive owner (MODIFIED state)\n\n");
+        
+        /* This write triggers ownership transfer! */
+        strcpy(data, "WORKER WROTE THIS - I took ownership!");
+        
+        if (dsm_get_page_info(data, &page_info) == 0) {
+            printf("[WORKER] After write - State: %s, Owner: %u, Version: %lu\n", 
+                   dsm_page_state_to_string(page_info.state), page_info.owner_id,
+                   page_info.version);
+        }
+        
+        if (page_info.owner_id == dsm_get_node_id() && 
+            page_info.state == 2) {  /* DSM_PAGE_MODIFIED */
+            printf("\n[WORKER] SUCCESS! We are now the exclusive owner!\n");
+            printf("[WORKER] State is MODIFIED/EXCLUSIVE - only we have a valid copy.\n");
+            printf("[WORKER] Press '7' on MASTER to verify they can read our changes.\n");
+        } else {
+            printf("\n[WORKER] Note: Check state/owner above.\n");
+        }
+    }
+}
+
 /* Interactive menu */
 static void show_menu(void) {
     printf("\n");
-    printf("==================================\n");
-    printf("   DSM Test Menu\n");
-    printf("==================================\n");
+    printf("========================================\n");
+    printf("   DSM Test Menu (Invalidate Protocol)\n");
+    printf("========================================\n");
     printf("  1. Test memory allocation\n");
     printf("  2. Test distributed locks\n");
     printf("  3. Test barrier sync\n");
     printf("  4. Show node info\n");
     printf("  5. Run all tests\n");
-    printf("  6. TRUE DSM test (page fault)\n");
+    printf("  6. Read-only DSM test (page fault)\n");
+    printf("  7. Read/Write DSM test (ownership xfer)\n");
+    printf("  8. Debug: Dump DSM state\n");
     printf("  q. Quit\n");
-    printf("==================================\n");
+    printf("========================================\n");
     printf("Choice: ");
 }
 
@@ -309,10 +443,20 @@ int main(int argc, char **argv) {
                 break;
             case '6':
                 if (dsm_get_node_count() < 2) {
-                    printf("\nNeed 2 nodes for TRUE DSM test. Start another node first.\n");
+                    printf("\nNeed 2 nodes for read-only DSM test. Start another node first.\n");
                 } else {
                     test_true_dsm();
                 }
+                break;
+            case '7':
+                if (dsm_get_node_count() < 2) {
+                    printf("\nNeed 2 nodes for Read/Write DSM test. Start another node first.\n");
+                } else {
+                    test_readwrite_dsm();
+                }
+                break;
+            case '8':
+                dsm_debug_dump_state();
                 break;
             case 'q':
             case 'Q':

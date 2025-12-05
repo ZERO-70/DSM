@@ -46,6 +46,9 @@ typedef struct {
     size_t              system_page_size;
     uint64_t            next_global_addr;   /* For master allocation */
     pthread_mutex_t     alloc_mutex;
+    pthread_cond_t      alloc_cond;         /* For worker allocation response */
+    volatile int        alloc_pending;      /* Waiting for allocation response */
+    volatile uint64_t   alloc_response_addr;/* Address returned by master */
     
     /* Page fault handling */
     int                 fault_eventfd;      /* Eventfd for signal handler */
@@ -56,6 +59,13 @@ typedef struct {
     pthread_cond_t      fault_cond;
     volatile int        fault_handled;      /* Flag: fault has been handled */
     volatile int        fault_result;       /* Result: 0=success, -1=failure */
+    volatile int        pending_access_type; /* 0=read, 1=write for current fault */
+    
+    /* Invalidation tracking (for Invalidate/Exclusive protocol) */
+    pthread_mutex_t     invalidate_mutex;
+    pthread_cond_t      invalidate_cond;
+    volatile uint32_t   invalidate_pending; /* Number of pending invalidate ACKs */
+    volatile uint64_t   invalidate_addr;    /* Page being invalidated */
     
     /* Synchronization */
     dsm_lock_t          locks[DSM_MAX_LOCKS];

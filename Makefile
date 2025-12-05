@@ -23,10 +23,12 @@ OBJS = $(patsubst $(SRC_DIR)/%.c,$(OBJ_DIR)/%.o,$(SRCS))
 # Test programs
 TEST_SRC = tests/test_dsm.c
 TEST_BIN = $(BIN_DIR)/test_dsm
+EXPLORER_SRC = tests/dsm_explorer.c
+EXPLORER_BIN = $(BIN_DIR)/dsm_explorer
 
 # Default target
 .PHONY: all
-all: dirs $(LIB_STATIC) $(LIB_SHARED) $(TEST_BIN)
+all: dirs $(LIB_STATIC) $(LIB_SHARED) $(TEST_BIN) $(EXPLORER_BIN)
 
 # Create directories
 .PHONY: dirs
@@ -52,6 +54,11 @@ $(TEST_BIN): tests/test_dsm.c $(LIB_STATIC)
 	@mkdir -p tests
 	$(CC) $(CFLAGS) -o $@ $< -L$(BIN_DIR) -ldsm $(LDFLAGS)
 	@echo "Built test program: $@"
+
+# Build explorer program
+$(EXPLORER_BIN): tests/dsm_explorer.c $(LIB_STATIC)
+	$(CC) $(CFLAGS) -o $@ $< -L$(BIN_DIR) -ldsm $(LDFLAGS)
+	@echo "Built explorer program: $@"
 
 # Clean
 .PHONY: clean

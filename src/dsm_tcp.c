@@ -65,16 +65,45 @@ static int set_keepalive(int fd) {
 int dsm_handle_message(int from_fd, dsm_msg_header_t *header, void *payload) {
     dsm_context_t *ctx = dsm_get_context();
     
-    LOG_DEBUG("Handling message type=%d from fd=%d, payload_len=%d", 
-              header->type, from_fd, header->payload_len);
+    LOG_DEBUG("Handling message type=%d from fd=%d, src_node=%d, payload_len=%d", 
+              header->type, from_fd, header->src_node, header->payload_len);
+    
+    /* CRITICAL: Associate this socket with the source node ID */
+    /* This allows master to send responses back to workers */
+    if (header->src_node > 0 && header->src_node != ctx->local_node_id) {
+        dsm_node_t *node = dsm_node_table_get(header->src_node);
+        if (node) {
+            if (node->tcp_fd != from_fd) {
+                LOG_INFO("[SOCKET] Associating node %d with fd=%d (was fd=%d)",
+                         header->src_node, from_fd, node->tcp_fd);
+                dsm_node_table_set_socket(header->src_node, from_fd);
+            }
+        } else {
+            LOG_WARN("[SOCKET] Received message from unknown node %d (fd=%d)",
+                     header->src_node, from_fd);
+        }
+        
+        /* CRITICAL: If we're a worker receiving from master (node 1), update master_fd */
+        if (header->src_node == 1 && ctx->master_fd != from_fd) {
+            LOG_INFO("[SOCKET] Setting master_fd=%d (was %d)", from_fd, ctx->master_fd);
+            ctx->master_fd = from_fd;
+        }
+    }
     
     switch (header->type) {
         case DSM_MSG_JOIN_RESPONSE: {
-            /* Worker receives assigned node_id from master */
-            if (header->payload_len >= sizeof(uint32_t)) {
+            /* Worker receives assigned node_id and global address from master */
+            if (header->payload_len >= sizeof(dsm_msg_join_response_t)) {
+                dsm_msg_join_response_t *resp = (dsm_msg_join_response_t*)payload;
+                ctx->local_node_id = resp->assigned_node_id;
+                ctx->next_global_addr = resp->global_base_addr;
+                LOG_INFO("Received node_id assignment: %d, global_base: 0x%lx, chunks: %d", 
+                        resp->assigned_node_id, resp->global_base_addr, resp->chunks);
+            } else if (header->payload_len >= sizeof(uint32_t)) {
+                /* Fallback for old-style response (just node_id) */
                 uint32_t assigned_id = *(uint32_t*)payload;
                 ctx->local_node_id = assigned_id;
-                LOG_INFO("Received node_id assignment: %d", assigned_id);
+                LOG_INFO("Received node_id assignment: %d (legacy)", assigned_id);
             }
             break;
         }
@@ -110,8 +139,49 @@ int dsm_handle_message(int from_fd, dsm_msg_header_t *header, void *payload) {
             /* Remote node requesting a page */
             if (header->payload_len >= sizeof(dsm_msg_page_request_t)) {
                 dsm_msg_page_request_t *req = (dsm_msg_page_request_t*)payload;
-                LOG_INFO("Page request for addr=0x%lx from node %d", 
+                LOG_INFO("[PAGE_REQ] Page request for addr=0x%lx from node %d", 
                          req->global_addr, header->src_node);
+                
+                /* Check if we actually own this page and can serve it */
+                dsm_page_t *page = dsm_page_lookup(req->global_addr);
+                if (!page) {
+                    LOG_ERROR("[PAGE_REQ] Page 0x%lx not found in our page table", req->global_addr);
+                    break;
+                }
+                
+                /* If the page is INVALID, we don't have valid data to send */
+                if (page->state == DSM_PAGE_INVALID) {
+                    LOG_WARN("[PAGE_REQ] Page 0x%lx is INVALID on this node", req->global_addr);
+                    
+                    /* If we're master, check ownership table and forward to actual owner */
+                    if (ctx->local_role == DSM_ROLE_MASTER) {
+                        int actual_owner = dsm_ownership_get(req->global_addr);
+                        LOG_INFO("[PAGE_REQ] Master forwarding request to actual owner node %d", actual_owner);
+                        
+                        if (actual_owner > 0 && (uint32_t)actual_owner != ctx->local_node_id) {
+                            /* Forward the request to the actual owner */
+                            dsm_msg_header_t fwd_hdr = dsm_create_header(DSM_MSG_PAGE_REQUEST, 
+                                                                          actual_owner, sizeof(*req));
+                            /* Modify src_node to be the original requester */
+                            dsm_msg_page_request_t fwd_req = *req;
+                            /* Note: The actual owner will send directly to header->src_node */
+                            
+                            /* We need to tell the owner who to reply to */
+                            fwd_hdr.src_node = header->src_node;  /* Original requester */
+                            dsm_tcp_send(actual_owner, &fwd_hdr, &fwd_req);
+                            LOG_INFO("[PAGE_REQ] Forwarded page request to node %d for requester %d",
+                                     actual_owner, header->src_node);
+                        } else {
+                            LOG_ERROR("[PAGE_REQ] Cannot forward: actual_owner=%d, local=%d",
+                                      actual_owner, ctx->local_node_id);
+                        }
+                    }
+                    break;
+                }
+                
+                /* We have valid data - send the page */
+                LOG_INFO("[PAGE_REQ] Serving page 0x%lx (state=%d) to node %d",
+                         req->global_addr, page->state, header->src_node);
                 dsm_page_send(header->src_node, req->global_addr);
             }
             break;
@@ -161,12 +231,17 @@ int dsm_handle_message(int from_fd, dsm_msg_header_t *header, void *payload) {
         
         case DSM_MSG_ALLOC_RESPONSE: {
             /* Allocation response from master */
-            /* This is handled synchronously in dsm_mem_alloc via a condition variable */
-            /* For now, we just log it */
             if (header->payload_len >= sizeof(dsm_msg_alloc_response_t)) {
                 dsm_msg_alloc_response_t *resp = (dsm_msg_alloc_response_t*)payload;
-                LOG_DEBUG("Allocation response: addr=0x%lx, size=%zu", 
-                         resp->global_addr, resp->size);
+                LOG_INFO("[ALLOC] Received allocation response: addr=0x%lx, size=%zu, owner=%d", 
+                         resp->global_addr, resp->size, resp->owner_id);
+                
+                /* Signal the waiting allocation request */
+                pthread_mutex_lock(&ctx->alloc_mutex);
+                ctx->alloc_response_addr = resp->global_addr;
+                ctx->alloc_pending = false;
+                pthread_cond_signal(&ctx->alloc_cond);
+                pthread_mutex_unlock(&ctx->alloc_mutex);
             }
             break;
         }
@@ -244,6 +319,103 @@ int dsm_handle_message(int from_fd, dsm_msg_header_t *header, void *payload) {
         case DSM_MSG_SHUTDOWN: {
             LOG_INFO("Received shutdown from node %d", header->src_node);
             dsm_node_table_remove(header->src_node);
+            break;
+        }
+        
+        /*====================================================================
+         * Invalidate/Exclusive Ownership Protocol Messages
+         *====================================================================*/
+        
+        case DSM_MSG_PAGE_WRITE_REQ: {
+            /* Node requesting write access (ownership transfer) */
+            if (header->payload_len >= sizeof(dsm_msg_page_write_request_t)) {
+                dsm_msg_page_write_request_t *req = (dsm_msg_page_write_request_t*)payload;
+                LOG_INFO("[PROTOCOL] PAGE_WRITE_REQ for addr=0x%lx from node %d", 
+                         req->global_addr, req->requesting_node);
+                
+                if (ctx->local_role == DSM_ROLE_MASTER) {
+                    /* Master coordinates the ownership transfer */
+                    dsm_handle_page_write_request(req->requesting_node, req->global_addr);
+                } else {
+                    /* We're the current owner - transfer ownership to requester */
+                    LOG_INFO("[PROTOCOL] Transferring page 0x%lx to node %d", 
+                             req->global_addr, req->requesting_node);
+                    dsm_page_send_with_ownership(req->requesting_node, req->global_addr, 1);
+                }
+            }
+            break;
+        }
+        
+        case DSM_MSG_PAGE_INVALIDATE: {
+            /* Master telling us to invalidate our copy */
+            if (header->payload_len >= sizeof(dsm_msg_page_invalidate_t)) {
+                dsm_msg_page_invalidate_t *inv = (dsm_msg_page_invalidate_t*)payload;
+                LOG_INFO("[PROTOCOL] PAGE_INVALIDATE for addr=0x%lx (new_owner=%d)", 
+                         inv->global_addr, inv->new_owner);
+                dsm_handle_page_invalidate(inv->global_addr, inv->new_owner);
+            }
+            break;
+        }
+        
+        case DSM_MSG_INVALIDATE_ACK: {
+            /* Node acknowledging invalidation */
+            if (header->payload_len >= sizeof(dsm_msg_invalidate_ack_t)) {
+                dsm_msg_invalidate_ack_t *ack = (dsm_msg_invalidate_ack_t*)payload;
+                LOG_INFO("[PROTOCOL] INVALIDATE_ACK for addr=0x%lx from node %d", 
+                         ack->global_addr, ack->acking_node);
+                dsm_handle_invalidate_ack(ack->acking_node, ack->global_addr);
+            }
+            break;
+        }
+        
+        case DSM_MSG_OWNERSHIP_XFER: {
+            /* Receiving ownership of a page */
+            if (header->payload_len >= sizeof(dsm_msg_ownership_xfer_t)) {
+                dsm_msg_ownership_xfer_t *xfer = (dsm_msg_ownership_xfer_t*)payload;
+                LOG_INFO("[PROTOCOL] OWNERSHIP_XFER for addr=0x%lx from node %d", 
+                         xfer->global_addr, xfer->old_owner);
+                dsm_handle_ownership_xfer(xfer->global_addr, xfer->data, xfer->size, 
+                                          xfer->version, xfer->old_owner);
+            }
+            break;
+        }
+        
+        /*====================================================================
+         * Page Discovery Messages
+         *====================================================================*/
+        
+        case DSM_MSG_LIST_PAGES_REQ: {
+            /* Worker requesting list of all pages from master */
+            if (ctx->local_role == DSM_ROLE_MASTER) {
+                LOG_INFO("[LIST_PAGES] Request from node %d", header->src_node);
+                
+                uint32_t count = 0;
+                dsm_msg_list_pages_t *pages = dsm_ownership_collect_all(&count);
+                
+                if (pages) {
+                    size_t payload_size = sizeof(dsm_msg_list_pages_t) + 
+                                          count * sizeof(dsm_page_entry_t);
+                    dsm_msg_header_t resp_hdr = dsm_create_header(DSM_MSG_LIST_PAGES_RESP,
+                                                                   header->src_node, payload_size);
+                    dsm_tcp_send(header->src_node, &resp_hdr, pages);
+                    LOG_INFO("[LIST_PAGES] Sent %u pages to node %d", count, header->src_node);
+                    free(pages);
+                } else {
+                    LOG_ERROR("[LIST_PAGES] Failed to collect ownership entries");
+                }
+            }
+            break;
+        }
+        
+        case DSM_MSG_LIST_PAGES_RESP: {
+            /* Response from master with list of all pages */
+            if (header->payload_len >= sizeof(dsm_msg_list_pages_t)) {
+                dsm_msg_list_pages_t *resp = (dsm_msg_list_pages_t*)payload;
+                LOG_INFO("[LIST_PAGES] Received %u pages from master", resp->count);
+                
+                /* Store the response for the waiting thread */
+                dsm_store_list_pages_response(resp, header->payload_len);
+            }
             break;
         }
         
@@ -631,25 +803,79 @@ int dsm_tcp_recv_raw(int sockfd, void *buf, size_t len) {
 }
 
 int dsm_tcp_send(uint32_t node_id, dsm_msg_header_t *header, void *payload) {
-    dsm_node_t *node = dsm_node_table_get(node_id);
-    if (!node || node->tcp_fd < 0) {
-        LOG_ERROR("Cannot send to node %d - not connected", node_id);
-        return -1;
+    dsm_context_t *ctx = dsm_get_context();
+    int sockfd = -1;
+    
+    LOG_DEBUG("[TCP_SEND] Sending msg type=%d to node %d (local_role=%d, master_fd=%d)", 
+              header->type, node_id, ctx->local_role, ctx->master_fd);
+    
+    /* Special case: Worker sending to master (node 1) - use master_fd */
+    if (ctx->local_role == DSM_ROLE_WORKER && node_id == 1 && ctx->master_fd >= 0) {
+        sockfd = ctx->master_fd;
+        LOG_DEBUG("[TCP_SEND] Worker using master_fd=%d to send to master", sockfd);
+    } else {
+        /* Look up in node table */
+        dsm_node_t *node = dsm_node_table_get(node_id);
+        if (node) {
+            LOG_DEBUG("[TCP_SEND] Node table lookup: node_id=%d, tcp_fd=%d, ip=%s, port=%d", 
+                      node->node_id, node->tcp_fd, node->ip, node->port);
+            if (node->tcp_fd >= 0) {
+                sockfd = node->tcp_fd;
+            }
+        } else {
+            LOG_DEBUG("[TCP_SEND] Node %d not found in node table", node_id);
+        }
+    }
+    
+    if (sockfd < 0) {
+        /* Try connect-on-demand: look up node's IP/port and connect */
+        dsm_node_t *node = dsm_node_table_get(node_id);
+        if (node && node->ip[0] != '\0' && node->port > 0) {
+            LOG_INFO("[TCP_SEND] No connection to node %d - attempting connect-on-demand to %s:%d",
+                     node_id, node->ip, node->port);
+            sockfd = dsm_tcp_connect(node->ip, node->port);
+            if (sockfd >= 0) {
+                /* Update node table with new socket */
+                dsm_node_table_set_socket(node_id, sockfd);
+                LOG_INFO("[TCP_SEND] Connect-on-demand succeeded: node %d now on fd=%d", node_id, sockfd);
+            } else {
+                LOG_ERROR("[TCP_SEND] Connect-on-demand failed for node %d (%s:%d)", 
+                          node_id, node->ip, node->port);
+            }
+        }
+        
+        if (sockfd < 0) {
+            LOG_ERROR("[TCP_SEND] Cannot send to node %d - not connected (role=%d, master_fd=%d)", 
+                      node_id, ctx->local_role, ctx->master_fd);
+            /* Dump node table for debugging */
+            LOG_DEBUG("[TCP_SEND] === Node table dump ===");
+            for (uint32_t i = 1; i <= dsm_node_table_count(); i++) {
+                dsm_node_t *n = dsm_node_table_get(i);
+                if (n) {
+                    LOG_DEBUG("[TCP_SEND]   Node %d: ip=%s, port=%d, fd=%d, role=%d", 
+                              n->node_id, n->ip, n->port, n->tcp_fd, n->role);
+                }
+            }
+            return -1;
+        }
     }
     
     /* Send header */
-    if (dsm_tcp_send_raw(node->tcp_fd, header, sizeof(*header)) != 0) {
+    if (dsm_tcp_send_raw(sockfd, header, sizeof(*header)) != 0) {
+        LOG_ERROR("[TCP_SEND] Failed to send header to node %d via fd=%d", node_id, sockfd);
         return -1;
     }
     
     /* Send payload if present */
     if (payload && header->payload_len > 0) {
-        if (dsm_tcp_send_raw(node->tcp_fd, payload, header->payload_len) != 0) {
+        if (dsm_tcp_send_raw(sockfd, payload, header->payload_len) != 0) {
+            LOG_ERROR("[TCP_SEND] Failed to send payload to node %d via fd=%d", node_id, sockfd);
             return -1;
         }
     }
     
-    LOG_DEBUG("Sent message type=%d to node %d", header->type, node_id);
+    LOG_DEBUG("[TCP_SEND] Success: msg type=%d (%zu+%d bytes) to node %d via fd=%d", 
+              header->type, sizeof(*header), header->payload_len, node_id, sockfd);
     return 0;
 }
 

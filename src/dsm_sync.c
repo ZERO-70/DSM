@@ -87,13 +87,14 @@ int dsm_sync_handle_lock_request(uint32_t from_node, uint32_t lock_id) {
     dsm_context_t *ctx = dsm_get_context();
     
     if (lock_id >= DSM_MAX_LOCKS) {
-        LOG_ERROR("Invalid lock_id: %d", lock_id);
+        LOG_ERROR("[LOCK] Invalid lock_id: %d", lock_id);
         return -1;
     }
     
     dsm_lock_t *lock = &ctx->locks[lock_id];
     
-    LOG_DEBUG("Lock request from node %d for lock %d", from_node, lock_id);
+    LOG_INFO("[LOCK] Request from node %d for lock %d (current holder=%d, locked=%d)", 
+             from_node, lock_id, lock->holder_id, lock->locked);
     
     pthread_mutex_lock(&lock->mutex);
     
@@ -103,21 +104,28 @@ int dsm_sync_handle_lock_request(uint32_t from_node, uint32_t lock_id) {
         lock->holder_id = from_node;
         pthread_mutex_unlock(&lock->mutex);
         
-        LOG_INFO("Lock %d granted to node %d", lock_id, from_node);
+        LOG_INFO("[LOCK] Lock %d granted to node %d (was free)", lock_id, from_node);
         
         /* Send grant message */
         dsm_msg_lock_t grant;
         grant.lock_id = lock_id;
         dsm_msg_header_t hdr = dsm_create_header(DSM_MSG_LOCK_GRANT, from_node, sizeof(grant));
-        dsm_tcp_send(from_node, &hdr, &grant);
+        int ret = dsm_tcp_send(from_node, &hdr, &grant);
+        if (ret != 0) {
+            LOG_ERROR("[LOCK] Failed to send LOCK_GRANT to node %d", from_node);
+        } else {
+            LOG_DEBUG("[LOCK] LOCK_GRANT sent to node %d", from_node);
+        }
     } else {
         /* Lock is held - add to waiters */
+        LOG_INFO("[LOCK] Lock %d held by node %d, queueing node %d", 
+                 lock_id, lock->holder_id, from_node);
         if (lock->waiter_count < DSM_MAX_NODES) {
             lock->waiters[lock->waiter_count++] = from_node;
-            LOG_DEBUG("Node %d added to lock %d wait queue (pos %d)", 
-                     from_node, lock_id, lock->waiter_count);
+            LOG_DEBUG("[LOCK] Node %d added to lock %d wait queue (pos %d, total waiters=%d)", 
+                     from_node, lock_id, lock->waiter_count - 1, lock->waiter_count);
         } else {
-            LOG_ERROR("Lock %d waiter queue full", lock_id);
+            LOG_ERROR("[LOCK] Lock %d waiter queue full!", lock_id);
         }
         pthread_mutex_unlock(&lock->mutex);
     }
@@ -129,19 +137,20 @@ int dsm_sync_handle_lock_release(uint32_t from_node, uint32_t lock_id) {
     dsm_context_t *ctx = dsm_get_context();
     
     if (lock_id >= DSM_MAX_LOCKS) {
-        LOG_ERROR("Invalid lock_id: %d", lock_id);
+        LOG_ERROR("[LOCK] Invalid lock_id: %d", lock_id);
         return -1;
     }
     
     dsm_lock_t *lock = &ctx->locks[lock_id];
     
-    LOG_DEBUG("Lock release from node %d for lock %d", from_node, lock_id);
+    LOG_INFO("[LOCK] Release from node %d for lock %d (current holder=%d, waiters=%d)", 
+             from_node, lock_id, lock->holder_id, lock->waiter_count);
     
     pthread_mutex_lock(&lock->mutex);
     
     if (!lock->locked || lock->holder_id != from_node) {
-        LOG_WARN("Node %d releasing lock %d not held by it (holder=%d)", 
-                from_node, lock_id, lock->holder_id);
+        LOG_WARN("[LOCK] Node %d releasing lock %d not held by it (holder=%d, locked=%d)", 
+                from_node, lock_id, lock->holder_id, lock->locked);
         pthread_mutex_unlock(&lock->mutex);
         return -1;
     }
@@ -162,21 +171,24 @@ int dsm_sync_handle_lock_release(uint32_t from_node, uint32_t lock_id) {
         
         pthread_mutex_unlock(&lock->mutex);
         
-        LOG_INFO("Lock %d transferred from node %d to node %d", 
-                lock_id, from_node, next_holder);
+        LOG_INFO("[LOCK] Lock %d transferred from node %d to node %d (remaining waiters=%d)", 
+                lock_id, from_node, next_holder, lock->waiter_count);
         
         /* Send grant to next waiter */
         dsm_msg_lock_t grant;
         grant.lock_id = lock_id;
         dsm_msg_header_t hdr = dsm_create_header(DSM_MSG_LOCK_GRANT, next_holder, sizeof(grant));
-        dsm_tcp_send(next_holder, &hdr, &grant);
+        int ret = dsm_tcp_send(next_holder, &hdr, &grant);
+        if (ret != 0) {
+            LOG_ERROR("[LOCK] Failed to send LOCK_GRANT to node %d", next_holder);
+        }
     } else {
         /* No waiters - free the lock */
         lock->locked = false;
         lock->holder_id = 0;
         pthread_mutex_unlock(&lock->mutex);
         
-        LOG_INFO("Lock %d released by node %d (now free)", lock_id, from_node);
+        LOG_INFO("[LOCK] Lock %d released by node %d (now free, no waiters)", lock_id, from_node);
     }
     
     return 0;
@@ -231,12 +243,12 @@ int dsm_sync_handle_barrier_enter(uint32_t from_node) {
  * Public API
  *===========================================================================*/
 
-void dsm_lock(int lock_id) {
+int dsm_lock(int lock_id) {
     dsm_context_t *ctx = dsm_get_context();
     
     if (lock_id < 0 || lock_id >= DSM_MAX_LOCKS) {
         LOG_ERROR("Invalid lock_id: %d", lock_id);
-        return;
+        return -1;
     }
     
     dsm_lock_t *lock = &ctx->locks[lock_id];
@@ -257,6 +269,7 @@ void dsm_lock(int lock_id) {
         pthread_mutex_unlock(&lock->mutex);
         
         LOG_INFO("Lock %d acquired (master)", lock_id);
+        return 0;
     } else {
         /* Worker sends request to master */
         dsm_msg_lock_t req;
@@ -279,7 +292,7 @@ void dsm_lock(int lock_id) {
         
         if (master_fd < 0) {
             LOG_ERROR("Cannot acquire lock - master not connected");
-            return;
+            return -1;
         }
         
         /* Send request */
@@ -299,6 +312,7 @@ void dsm_lock(int lock_id) {
         
         LOG_INFO("Lock %d acquired (worker)", lock_id);
     }
+    return 0;
 }
 
 void dsm_unlock(int lock_id) {
